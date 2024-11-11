@@ -20,7 +20,6 @@
 #include "ImfOutputPart.h"
 #include "ImfPartType.h"
 #include "ImfTiledInputPart.h"
-#include "ImfTiledMisc.h"
 #include "ImfTiledOutputPart.h"
 
 #include <chrono>
@@ -43,6 +42,204 @@ using std::runtime_error;
 using std::string;
 using std::to_string;
 using std::vector;
+
+// Backport from 3.3.1
+#if OPENEXR_VERSION_MINOR < 3
+
+/// Store codec properties so they may be queried in various places.
+struct CompressionDesc
+{
+    std::string name;         // short name
+    std::string desc;         // method description
+    int         numScanlines; // number of scanlines required
+    bool        lossy;        // true if lossy algorithm
+    bool        deep;         // true is capable of compressing deep data
+
+    CompressionDesc (
+        std::string _name,
+        std::string _desc,
+        int         _scanlines,
+        bool        _lossy,
+        bool        _deep)
+    {
+        name         = _name;
+        desc         = _desc;
+        numScanlines = _scanlines;
+        lossy        = _lossy;
+        deep         = _deep;
+    }
+};
+
+// NOTE: IdToDesc order MUST match Imf::Compression enum.
+// clang-format off
+static const CompressionDesc IdToDesc[] = {
+    CompressionDesc (
+        "none",
+        "no compression.",
+        1,
+        false,
+        true),
+    CompressionDesc (
+        "rle",
+        "run-length encoding.",
+        1,
+        false,
+        true),
+    CompressionDesc (
+        "zips",
+        "zlib compression, one scan line at a time.",
+        1,
+        false,
+        true),
+    CompressionDesc (
+        "zip",
+        "zlib compression, in blocks of 16 scan lines.",
+        16,
+        false,
+        false),
+    CompressionDesc (
+        "piz",
+        "piz-based wavelet compression, in blocks of 32 scan lines.",
+        32,
+        false,
+        false),
+    CompressionDesc (
+        "pxr24",
+        "lossy 24-bit float compression, in blocks of 16 scan lines.",
+        16,
+        true,
+        false),
+    CompressionDesc (
+        "b44",
+        "lossy 4-by-4 pixel block compression, fixed compression rate.",
+        32,
+        true,
+        false),
+    CompressionDesc (
+        "b44a",
+        "lossy 4-by-4 pixel block compression, flat fields are compressed more.",
+        32,
+        true,
+        false),
+    CompressionDesc (
+        "dwaa",
+        "lossy DCT based compression, in blocks of 32 scanlines. More efficient "
+        "for partial buffer access.",
+        32,
+        true,
+        false),
+    CompressionDesc (
+        "dwab",
+        "lossy DCT based compression, in blocks of 256 scanlines. More efficient "
+        "space wise and faster to decode full frames than DWAA_COMPRESSION.",
+        256,
+        true,
+        false),
+};
+// clang-format on
+
+// NOTE: CompressionNameToId order MUST match Imf::Compression enum.
+static const std::map<std::string, Compression> CompressionNameToId = {
+    {"no", Compression::NO_COMPRESSION},
+    {"none", Compression::NO_COMPRESSION},
+    {"rle", Compression::RLE_COMPRESSION},
+    {"zips", Compression::ZIPS_COMPRESSION},
+    {"zip", Compression::ZIP_COMPRESSION},
+    {"piz", Compression::PIZ_COMPRESSION},
+    {"pxr24", Compression::PXR24_COMPRESSION},
+    {"b44", Compression::B44_COMPRESSION},
+    {"b44a", Compression::B44A_COMPRESSION},
+    {"dwaa", Compression::DWAA_COMPRESSION},
+    {"dwab", Compression::DWAB_COMPRESSION},
+};
+
+#define UNKNOWN_COMPRESSION_ID_MSG "INVALID COMPRESSION ID"
+
+/// Returns a codec ID's short name (lowercase).
+void
+getCompressionNameFromId (Compression id, std::string& name)
+{
+    if (id < NO_COMPRESSION || id >= NUM_COMPRESSION_METHODS)
+        name = UNKNOWN_COMPRESSION_ID_MSG;
+    name = IdToDesc[static_cast<int> (id)].name;
+}
+
+/// Return the number of scan lines expected by a given compression method.
+int
+getCompressionNumScanlines (Compression id)
+{
+    if (id < NO_COMPRESSION || id >= NUM_COMPRESSION_METHODS) return -1;
+    return IdToDesc[static_cast<int> (id)].numScanlines;
+}
+
+/// Returns the codec name's ID, NUM_COMPRESSION_METHODS if not found.
+void
+getCompressionIdFromName (const std::string& name, Compression& id)
+{
+    std::string lowercaseName (name);
+    for (auto& ch: lowercaseName)
+        ch = std::tolower (ch);
+
+    auto it = CompressionNameToId.find (lowercaseName);
+    id      = it != CompressionNameToId.end ()
+                  ? it->second
+                  : Compression::NUM_COMPRESSION_METHODS;
+}
+
+/// Return a string enumerating all compression names, with a custom separator.
+void
+getCompressionNamesString (const std::string& separator, std::string& str)
+{
+    int i = 0;
+    for (; i < static_cast<int> (NUM_COMPRESSION_METHODS) - 1; i++)
+    {
+        str += IdToDesc[i].name + separator;
+    }
+    str += IdToDesc[i].name;
+}
+
+#endif
+
+
+// ----8<----
+// Taken from ImfTiledMisc.cpp to allow standalone compilation
+using IMATH_NAMESPACE::V2i;
+
+int
+levelSize (int min, int max, int l, LevelRoundingMode rmode)
+{
+    if (l < 0) throw IEX_NAMESPACE::ArgExc ("Argument not in valid range.");
+
+    int a    = max - min + 1;
+    int b    = (1 << l);
+    int size = a / b;
+
+    if (rmode == ROUND_UP && size * b < a) size += 1;
+
+    return std::max (size, 1);
+}
+
+Box2i
+dataWindowForLevel (
+    const TileDescription& tileDesc,
+    int                    minX,
+    int                    maxX,
+    int                    minY,
+    int                    maxY,
+    int                    lx,
+    int                    ly)
+{
+    V2i levelMin = V2i (minX, minY);
+
+    V2i levelMax =
+        levelMin + V2i (
+                       levelSize (minX, maxX, lx, tileDesc.roundingMode) - 1,
+                       levelSize (minY, maxY, ly, tileDesc.roundingMode) - 1);
+
+    return Box2i (levelMin, levelMax);
+}
+
+// ----8<----
 
 double
 timing (steady_clock::time_point start, steady_clock::time_point end)

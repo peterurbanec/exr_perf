@@ -6,7 +6,6 @@
 
 #include "exrmetrics.h"
 
-#include "ImfCompression.h"
 #include "ImfMisc.h"
 
 #include <iostream>
